@@ -1,29 +1,31 @@
 # Timesheet Pipeline — Azure Blob Edition
 
-Automated pipeline that pulls timesheet and roster data from OPMS, resolves project clients via SharePoint, matches unit rates, and stores results in Azure Blob Storage.
+Stateful incremental ETL pipeline with cursor/date checkpoint recovery.
+
+Pulls workforce data from OPMS, enriches with SharePoint contract and rate data, and persists results as Parquet to Azure Blob Storage — fully automated on a weekly schedule via Azure Functions.
 
 ---
 
-## Pipeline Overview
+## Pipeline Architecture
 
 ```mermaid
 flowchart TD
-    STATE(["📋 pipeline_state.json\nroster_last_end · cursor · modified_since"])
+    STATE(["📋 pipeline_state.json\nCheckpoint & State Management"])
     OPMS(["🔌 OPMS API"])
-    SP(["📂 SharePoint"])
+    SP(["📂 SharePoint Online\nMicrosoft Graph API"])
 
-    P1["Phase 1: Roster\nIncremental by date"]
-    P2["Phase 2: Timesheet\nIncremental by cursor"]
-    P3["Phase 3: Merge\nNew EmployeeID × Date keys"]
-    P4["Phase 4: Resolve Client\nresourceRequestClient"]
-    P5["Phase 5: Rate Lookup\nUnitRate"]
-    BLOB[("☁️ Azure Blob\nmerged.parquet")]
-    TIMER[/"⏰ Every Tue 02:00 AWST"\]
+    P1["Phase 1: Incremental Roster Extraction\nDate-based watermark sync"]
+    P2["Phase 2: Cursor-based Timesheet Sync\nResumable cursor pagination"]
+    P3["Phase 3: Delta Merge & Deduplication\nEmployeeID × Date key"]
+    P4["Phase 4: SharePoint Client Enrichment\nresourceRequestClient resolution"]
+    P5["Phase 5: Rate & Cost Resolution\nUnitRate lookup via JMS-Rates"]
+    BLOB[("☁️ Azure Blob Storage\nParquet Data Lake")]
+    TIMER[/"⏰ Azure Functions Timer\nEvery Tue 02:00 AWST"\]
 
     OPMS --> P1
     OPMS --> P2
-    STATE -.->|roster_last_end| P1
-    STATE -.->|modified_since · cursor| P2
+    STATE -.->|date watermark| P1
+    STATE -.->|cursor · modified_since| P2
     P1 --> P3
     P2 --> P3
     SP --> P4
@@ -37,29 +39,58 @@ flowchart TD
 
     style STATE fill:#FAEEDA,stroke:#BA7517,color:#633806
     style OPMS fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style SP  fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style P1  fill:#EEEDFE,stroke:#534AB7,color:#3C3489
-    style P2  fill:#EEEDFE,stroke:#534AB7,color:#3C3489
-    style P3  fill:#E6F1FB,stroke:#185FA5,color:#0C447C
-    style P4  fill:#FAECE7,stroke:#993C1D,color:#712B13
-    style P5  fill:#FAECE7,stroke:#993C1D,color:#712B13
+    style SP   fill:#E1F5EE,stroke:#0F6E56,color:#085041
+    style P1   fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    style P2   fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    style P3   fill:#E6F1FB,stroke:#185FA5,color:#0C447C
+    style P4   fill:#FAECE7,stroke:#993C1D,color:#712B13
+    style P5   fill:#FAECE7,stroke:#993C1D,color:#712B13
     style BLOB fill:#F1EFE8,stroke:#5F5E5A,color:#444441
     style TIMER fill:#F1EFE8,stroke:#5F5E5A,color:#444441,stroke-dasharray:4
 ```
 
 | Phase | Description | Output |
 |-------|-------------|--------|
-| 1 | Fetch roster from OPMS (incremental by date) | `data/roster.parquet` |
-| 2 | Fetch timesheets from OPMS (incremental by cursor) | `data/timesheet.parquet` |
-| 3 | Merge roster + timesheet (incremental by key) | `data/merged.parquet` |
-| 4 | Resolve `resourceRequestClient` via SharePoint | `data/merged.parquet` |
-| 5 | Look up `UnitRate` via SharePoint JMS-Rates | `data/merged.parquet` |
+| 1 | Incremental roster extraction with date watermark | `data/roster.parquet` |
+| 2 | Cursor-based timesheet sync with resumable pagination | `data/timesheet.parquet` |
+| 3 | Delta merge and deduplication on `EmployeeID × Date` key | `data/merged.parquet` |
+| 4 | SharePoint client enrichment via Graph API | `data/merged.parquet` |
+| 5 | Rate and cost resolution via JMS-Rates lookup | `data/merged.parquet` |
 
 ---
 
-## Incremental Strategy
+## Features
 
-State is stored in `config/pipeline_state.json` on Azure Blob:
+- Incremental roster synchronization with date-based watermark
+- Cursor-based timesheet ingestion with resumable pagination
+- Stateful pipeline recovery via checkpoint persistence
+- SharePoint client enrichment via Microsoft Graph API
+- Delta merge deduplication on composite key
+- Azure Blob Parquet persistence (columnar data lake)
+- Automated scheduled execution via Azure Functions
+- Cloud-native ETL architecture with no local state dependency
+
+---
+
+## Architecture Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Runtime | Python 3.11 |
+| Orchestration | Azure Functions (Timer Trigger) |
+| Cloud Storage | Azure Blob Storage |
+| Data Format | Apache Parquet (PyArrow) |
+| Enrichment API | Microsoft Graph API / SharePoint Online |
+| Source API | OPMS REST API |
+| Data Processing | Pandas |
+| State Management | JSON checkpoint on Azure Blob |
+| Pipeline Pattern | Incremental ETL / Stateful Sync |
+
+---
+
+## Checkpoint & State Management
+
+All pipeline state is persisted to `config/pipeline_state.json` on Azure Blob. On each run the pipeline reads state, resumes from the last known position, and writes updated state on completion — enabling full recovery from any mid-run failure.
 
 ```json
 {
@@ -71,10 +102,12 @@ State is stored in `config/pipeline_state.json` on Azure Blob:
 }
 ```
 
-- **Roster**: pulls from `roster_last_end + 1 day` to today
-- **Timesheet**: uses `modified_since` to pull only changed records; advances to today after each full fetch
-- **Merge**: only reprocesses new `(EmployeeID, Date)` keys
-- **Resolve / Rates**: skips rows that already have values
+| Field | Purpose |
+|-------|---------|
+| `roster_last_end` | Date watermark — next run starts from +1 day |
+| `timesheet_cursor` | API pagination cursor — resumes mid-fetch on failure |
+| `timesheet_modified_since` | Incremental window — advances to today after full fetch |
+| `updated_at` | Perth AWST timestamp of last successful write |
 
 ---
 
@@ -82,21 +115,19 @@ State is stored in `config/pipeline_state.json` on Azure Blob:
 
 ```
 ├── function_app.py          # Azure Functions entry point (Timer Trigger)
-├── host.json                # Azure Functions configuration
-├── main.py                  # Main pipeline orchestrator
-├── Roster+timesheet+com.py  # OPMS API: roster + timesheet fetch
-├── Sharepoint_contracts.py  # SharePoint: resolve resourceRequestClient
-├── Sharepoint_Rates.py      # SharePoint: look up UnitRate
+├── host.json                # Azure Functions host configuration
+├── main.py                  # Pipeline orchestrator
+├── Roster+timesheet+com.py  # OPMS API: roster + timesheet extraction
+├── Sharepoint_contracts.py  # Graph API: client enrichment
+├── Sharepoint_Rates.py      # Graph API: rate & cost resolution
 ├── requirements.txt         # Python dependencies
-├── .env                     # Local environment variables (not in git)
+├── .env                     # Local secrets (not committed)
 └── .gitignore
 ```
 
 ---
 
 ## Environment Variables
-
-Create a `.env` file locally (never commit this):
 
 ```env
 # OPMS
@@ -107,7 +138,7 @@ OPMS_CLIENT_SECRET=
 AZURE_STORAGE_CONNECTION_STRING=
 AZURE_BLOB_CONTAINER=timesheethour
 
-# SharePoint
+# SharePoint / Microsoft Graph
 SHAREPOINT_TENANT_ID=
 SHAREPOINT_CLIENT_ID=
 SHAREPOINT_CLIENT_SECRET=
@@ -134,7 +165,7 @@ pip install -r requirements.txt
 # Run full pipeline
 python main.py
 
-# Run a specific phase only
+# Run a specific phase
 python main.py --phase roster
 python main.py --phase timesheet
 python main.py --phase merge
@@ -149,9 +180,7 @@ python main.py --upload-map Project_Client_Map.csv
 
 ## Azure Functions Deployment
 
-Triggered every **Tuesday 02:00 AWST** (Monday 18:00 UTC).
-
-Deploy via Azure CLI:
+Triggered every **Tuesday 02:00 AWST** (UTC Monday 18:00).
 
 ```bash
 az functionapp deployment source config \
@@ -166,15 +195,15 @@ Set all environment variables under **Function App → Configuration → Applica
 
 ---
 
-## Blob Storage Structure
+## Blob Storage Layout
 
 ```
 timesheethour/
 ├── data/
-│   ├── roster.parquet
-│   ├── timesheet.parquet
-│   └── merged.parquet          ← Final output (used by Power BI)
+│   ├── roster.parquet          ← Raw roster (incremental append)
+│   ├── timesheet.parquet       ← Raw timesheets (incremental append)
+│   └── merged.parquet          ← Enriched output (Power BI source)
 └── config/
-    ├── pipeline_state.json     ← Incremental state / checkpoints
-    └── Project_Client_Map.csv  ← Manual project → client mapping
+    ├── pipeline_state.json     ← Checkpoint & state management
+    └── Project_Client_Map.csv  ← Manual project-to-client mapping
 ```
