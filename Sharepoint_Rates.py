@@ -1,14 +1,14 @@
 """
 rate_lookup.py
 ==============
-Step 1  : 删除 resourceRequestClient = "C0000-Marlu" 或含 "Z OH" 的行
+Step 1  : Remove rows where resourceRequestClient = "C0000-Marlu" or contains "Z OH"
 Step 2  : WorkType → DS / NS
-Step 3  : JMS-Rates 匹配单价 → 写入 UnitRate 列（增量：跳过已有值的行）
+Step 3  : Match unit rates from JMS-Rates → write to UnitRate column (incremental: skip rows already rated)
 
-增量策略:
-  - 已有 UnitRate 的行直接保留，不重新查 SharePoint
-  - 只对 UnitRate 为空的行做匹配
-  - SharePoint（PPL-Positions / JMS-Rates）只在有待处理行时才连接
+Incremental strategy:
+  - Rows that already have a UnitRate value are kept as-is
+  - Only unrated rows are matched against SharePoint
+  - SharePoint (PPL-Positions / JMS-Rates) is only called when there are pending rows
 """
 
 import io
@@ -131,7 +131,7 @@ def classify_shift(worktype: str) -> str:
 # ─── STEP 3: BUILD RATES MAPS ────────────────────────────────────────────────
 
 def build_rates_map(token: str, site_id: str) -> Tuple[Dict, Dict]:
-    # PPL-Positions: item id → Title (统一转大写，避免大小写不匹配)
+    # PPL-Positions: item id → Title (uppercase to avoid case mismatch)
     print("\nFetching PPL-Positions...")
     pos_list_id = get_list_id(token, site_id, "PPL-Positions")
     pos_items   = fetch_all_list_items(token, site_id, pos_list_id)
@@ -139,7 +139,7 @@ def build_rates_map(token: str, site_id: str) -> Tuple[Dict, Dict]:
     pos_id_to_title: Dict[str, str] = {}
     for item in pos_items:
         item_id = str(item.get("id", "")).strip()
-        title   = str(item.get("fields", {}).get("Title", "")).strip().upper()  # ← 统一大写
+        title   = str(item.get("fields", {}).get("Title", "")).strip().upper()
         if item_id and title:
             pos_id_to_title[item_id] = title
     print(f"  → {len(pos_id_to_title)} positions loaded")
@@ -156,7 +156,7 @@ def build_rates_map(token: str, site_id: str) -> Tuple[Dict, Dict]:
         f           = item.get("fields", {})
         project_id  = str(f.get("ProjectID") or "").strip().upper()
         pos_lid     = str(f.get("PositionLookupId") or "").strip()
-        pos_title   = pos_id_to_title.get(pos_lid, "")   # 已是大写
+        pos_title   = pos_id_to_title.get(pos_lid, "")
         day_shift   = f.get("DayShift")
         night_shift = f.get("NightShift")
 
@@ -182,7 +182,7 @@ def build_rates_map(token: str, site_id: str) -> Tuple[Dict, Dict]:
 def lookup_rate(project_client: str, position: str, shift: str,
                 specific: Dict, default: Dict) -> Optional[float]:
     proj_id  = str(project_client).strip().upper().split("-")[0]
-    pos_up   = str(position).strip().upper()   # ← 统一大写，与 build_rates_map 一致
+    pos_up   = str(position).strip().upper()
     shift_up = shift.upper()
 
     rate = specific.get((proj_id, pos_up, shift_up))
@@ -193,12 +193,12 @@ def lookup_rate(project_client: str, position: str, shift: str,
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── 读取 merged.parquet ───────────────────────────────────────
+    # ── Load merged.parquet ───────────────────────────────────────
     print("Loading merged.parquet from Blob...")
     df = download_df_from_blob(BLOB_MERGED)
     print(f"  Loaded {len(df)} rows")
 
-    # ── Step 1: 删除 C0000-Marlu 和 Z OH ─────────────────────────
+    # ── Step 1: Remove C0000-Marlu and Z OH ──────────────────────
     before     = len(df)
     client_col = df["resourceRequestClient"].astype(str).str.strip()
     drop_mask  = (
@@ -208,17 +208,20 @@ def main():
     df = df[~drop_mask].reset_index(drop=True)
     print(f"Step 1: Removed {before - len(df)} rows → {len(df)} remaining")
 
-    # ── Step 2: WorkType → DS / NS（全量重算，保证新行都有值）──────
+    # ── Step 2: WorkType → DS / NS (recalculate all rows to cover new entries) ──
     df["Shift"] = df["WorkType"].apply(classify_shift)
     print(f"Step 2: DS={(df['Shift']=='DS').sum()}, NS={(df['Shift']=='NS').sum()}")
 
-    # ── Step 3: 增量匹配单价 ──────────────────────────────────────
-    # 确保 UnitRate 列存在
+    # ── Step 3: Incremental rate matching ────────────────────────
+    # Ensure UnitRate column exists as object dtype to allow None and float together
     if "UnitRate" not in df.columns:
-        df["UnitRate"] = None
+        df["UnitRate"] = pd.array([None] * len(df), dtype=object)  # ← fix: object dtype
+    else:
+        # Cast existing column to object so None can be assigned alongside floats
+        df["UnitRate"] = df["UnitRate"].astype(object)             # ← fix: cast to object
 
-    # 分离：已有费率 vs 待处理
-    rated_mask = df["UnitRate"].notna()
+    # Split: already rated vs pending
+    rated_mask    = df["UnitRate"].notna()
     rated_count   = rated_mask.sum()
     pending_count = (~rated_mask).sum()
     print(f"Step 3: Already rated={rated_count}, Pending={pending_count}")
@@ -228,7 +231,7 @@ def main():
         upload_df_to_blob(df, BLOB_MERGED)
         return
 
-    # 只对待处理行连接 SharePoint
+    # Only connect to SharePoint for pending rows
     print("\nConnecting to SharePoint...")
     token   = get_access_token()
     site_id = get_site_id(token)
@@ -258,10 +261,10 @@ def main():
         print("\n  Unmatched combos (first 20):")
         print(miss.to_string(index=False))
 
-    # ── 写回 Blob ─────────────────────────────────────────────────
+    # ── Write back to Blob ────────────────────────────────────────
     print(f"\nWriting back to Blob...")
     upload_df_to_blob(df, BLOB_MERGED)
-    print(f"\n完成 ✅  UnitRate filled: {matched} / {len(df)} rows")
+    print(f"\nDone ✅  UnitRate filled: {matched} / {len(df)} rows")
 
 
 if __name__ == "__main__":
