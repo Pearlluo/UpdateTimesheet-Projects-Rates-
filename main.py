@@ -1,13 +1,13 @@
 """
 main.py
 =======
-主程序 — 按顺序串联所有模块，全部数据存到 Azure Blob。
+Main entry point — runs all pipeline phases in sequence, storing all data in Azure Blob.
 
-状态管理:
-  所有断点统一存在 blob: config/pipeline_state.json
-  每次启动读档，跑完写档。
+State management:
+  All checkpoints are stored in blob: config/pipeline_state.json
+  State is loaded at startup and saved after each run.
 
-pipeline_state.json 结构:
+pipeline_state.json structure:
   {
     "roster_last_end":           "2026-05-22",
     "timesheet_cursor":          null,
@@ -16,14 +16,14 @@ pipeline_state.json 结构:
     "updated_at":                "2026-05-22 14:29:31 AWST"
   }
 
-增量策略:
-  Phase 1: 读 roster_last_end，从它+1天拉到今天，拉完更新
-  Phase 2: cursor 有值则续拉；cursor 为 null 则用 modified_since 拉增量
-           拉完后 modified_since 推进到今天 Perth 0 点，下次只拉增量
-  Phase 3: 只重算本次新增的 (EmployeeID, Date) key
-  Phase 4/5: 子模块内部增量处理
+Incremental strategy:
+  Phase 1: Read roster_last_end, fetch from that date +1 day to today, update on completion
+  Phase 2: Resume from cursor if present; otherwise use modified_since for incremental fetch.
+           After a full fetch, advance modified_since to today (Perth midnight) so next run only pulls changes.
+  Phase 3: Only reprocess (EmployeeID, Date) keys added in this run
+  Phase 4/5: Incremental logic handled internally by each sub-module
 
-用法:
+Usage:
   python main.py
   python main.py --phase roster / timesheet / merge / resolve / rates
   python main.py --upload-map path.csv
@@ -47,7 +47,7 @@ load_dotenv()
 
 
 # ================================================================
-# PERTH TIME  (AWST = UTC+8，无夏令时)
+# PERTH TIME  (AWST = UTC+8, no daylight saving)
 # ================================================================
 PERTH_TZ = timezone(timedelta(hours=8))
 
@@ -58,7 +58,7 @@ def perth_now_str() -> str:
     return datetime.now(tz=PERTH_TZ).strftime("%Y-%m-%d %H:%M:%S AWST")
 
 def perth_today_iso() -> str:
-    """Perth 今天 0 点，作为 OPMS modified_since 参数"""
+    """Perth today at midnight, used as OPMS modified_since parameter."""
     return perth_today().strftime("%Y-%m-%dT00:00:00Z")
 
 
@@ -74,7 +74,7 @@ BLOB_MERGED      = "data/merged.parquet"
 BLOB_PROJECT_MAP = "config/Project_Client_Map.csv"
 BLOB_STATE       = "config/pipeline_state.json"
 
-# 仅首次运行使用的初始默认值
+# Initial defaults used only on first run
 INITIAL_START_DATE     = date(2024, 1, 1)
 INITIAL_MODIFIED_SINCE = "2024-01-01T00:00:00Z"
 
@@ -121,7 +121,7 @@ def upload_csv_file(local_path: str, blob_path: str) -> None:
 
 
 # ================================================================
-# STATE — 读档 / 写档
+# STATE — load / save
 # ================================================================
 def load_state() -> Dict[str, Any]:
     data = download_bytes(BLOB_STATE)
@@ -131,13 +131,13 @@ def load_state() -> Dict[str, Any]:
             print(f"📂 State loaded:")
             print(f"   roster_last_end          = {state.get('roster_last_end')}")
             print(f"   timesheet_modified_since = {state.get('timesheet_modified_since')}")
-            print(f"   timesheet_cursor         = {'有（续拉）' if state.get('timesheet_cursor') else '无（新一轮）'}")
+            print(f"   timesheet_cursor         = {'resuming' if state.get('timesheet_cursor') else 'fresh run'}")
             print(f"   updated_at               = {state.get('updated_at')}")
             return state
         except Exception as e:
             print(f"⚠️  Failed to parse state JSON: {e}")
 
-    print("🆕 No state file, initialising defaults")
+    print("🆕 No state file found, initialising defaults")
     return {
         "roster_last_end":           INITIAL_START_DATE.isoformat(),
         "timesheet_cursor":          None,
@@ -153,7 +153,7 @@ def save_state(state: Dict[str, Any]) -> None:
     print(f"💾 State saved → blob://{AZURE_CONTAINER}/{BLOB_STATE}")
     print(f"   roster_last_end          = {state.get('roster_last_end')}")
     print(f"   timesheet_modified_since = {state.get('timesheet_modified_since')}")
-    print(f"   timesheet_cursor         = {'有' if state.get('timesheet_cursor') else '无'}")
+    print(f"   timesheet_cursor         = {'present' if state.get('timesheet_cursor') else 'none'}")
 
 
 # ================================================================
@@ -184,7 +184,7 @@ def _load_mod(name: str, filename: str):
 
 
 # ================================================================
-# PHASE 1: ROSTER  (增量，按日期)
+# PHASE 1: ROSTER  (incremental, by date)
 # ================================================================
 def phase_roster(state: Dict[str, Any]) -> pd.DataFrame:
     print("\n" + "=" * 60)
@@ -222,17 +222,17 @@ def phase_roster(state: Dict[str, Any]) -> pd.DataFrame:
 
 
 # ================================================================
-# PHASE 2: TIMESHEET  (增量，modified_since 每次拉完推进到今天)
+# PHASE 2: TIMESHEET  (incremental, modified_since advances to today after each full fetch)
 #
-# 情况 A — cursor 有值（上次中断未拉完）:
-#   沿用同一个 modified_since 继续拉，拉完后推进到今天
+# Case A — cursor present (previous run interrupted):
+#   Continue from the same modified_since; advance to today once complete.
 #
-# 情况 B — cursor 为 null（正常新一轮）:
-#   用 state 里的 modified_since（上次推进过的日期）拉增量
-#   只拉那天之后有变动的记录，通常很少几页
+# Case B — cursor is null (normal new run):
+#   Use modified_since from state (advanced from last run).
+#   Only fetches records changed since that date — typically a few pages.
 #
-# 两种情况拉完后都把 modified_since 推进到今天 Perth 0 点
-# 下次跑就只拉今天之后的变动
+# In both cases, modified_since is advanced to today (Perth midnight) after a full fetch.
+# The next run will only pull changes after that point.
 # ================================================================
 def phase_timesheet(state: Dict[str, Any]) -> pd.DataFrame:
     print("\n" + "=" * 60)
@@ -242,7 +242,7 @@ def phase_timesheet(state: Dict[str, Any]) -> pd.DataFrame:
     rtc            = _load_rtc()
     modified_since = state.get("timesheet_modified_since", INITIAL_MODIFIED_SINCE)
 
-    # 构建临时 checkpoint 文件
+    # Build temporary checkpoint file
     checkpoint = {}
     if state.get("timesheet_cursor"):
         checkpoint = {
@@ -250,9 +250,9 @@ def phase_timesheet(state: Dict[str, Any]) -> pd.DataFrame:
             "fetched_count":  state.get("timesheet_fetched_count", 0),
             "modified_since": modified_since,
         }
-        print(f"🔁 情况A: cursor 续拉，already ≈ {checkpoint['fetched_count']}")
+        print(f"🔁 Case A: resuming from cursor, already fetched ≈ {checkpoint['fetched_count']}")
     else:
-        print(f"🆕 情况B: 新一轮增量")
+        print(f"🆕 Case B: fresh incremental run")
 
     print(f"   modified_since = {modified_since}")
 
@@ -267,7 +267,7 @@ def phase_timesheet(state: Dict[str, Any]) -> pd.DataFrame:
         use_checkpoint=True
     )
 
-    # 读拉完后的 checkpoint
+    # Read checkpoint after fetch completes
     final_cp = {}
     if tmp_cp.exists():
         try:
@@ -275,28 +275,28 @@ def phase_timesheet(state: Dict[str, Any]) -> pd.DataFrame:
         except Exception:
             pass
 
-    # ── 关键：拉完（next_cursor=null）就把 modified_since 推进到今天 ──
+    # Advance modified_since to today once fetch is complete (next_cursor is null)
     if not final_cp.get("next_cursor"):
         today_iso = perth_today_iso()
         state["timesheet_cursor"]         = None
         state["timesheet_fetched_count"]  = 0
-        state["timesheet_modified_since"] = today_iso        # ← 推进
-        print(f"✅ 拉完，modified_since 推进到 {today_iso}")
-        print(f"   下次只拉 {today_iso} 之后有变动的记录")
+        state["timesheet_modified_since"] = today_iso        # ← advance
+        print(f"✅ Fetch complete, modified_since advanced to {today_iso}")
+        print(f"   Next run will only fetch changes after {today_iso}")
     else:
-        # 中断了，保存 cursor 等下次续拉，modified_since 保持不变
+        # Interrupted — save cursor and keep modified_since unchanged until fetch completes
         state["timesheet_cursor"]         = final_cp["next_cursor"]
         state["timesheet_fetched_count"]  = final_cp.get("fetched_count", 0)
-        state["timesheet_modified_since"] = modified_since   # ← 不变，续完再推进
-        print(f"⏸  中断，cursor 已保存，下次续拉")
+        state["timesheet_modified_since"] = modified_since   # ← unchanged, advance after resume
+        print(f"⏸  Interrupted — cursor saved, will resume next run")
 
     save_state(state)
 
-    # flatten（用初始日期过滤，确保不丢历史）
+    # Flatten (filter from initial date to avoid losing history)
     ts_df = rtc.flatten_to_long(all_ts, start_date=INITIAL_START_DATE.isoformat())
     print(f"✅ Timesheet rows this run: {len(ts_df)}")
 
-    # 合并到已有 timesheet（新增覆盖旧值，按 key 去重取最新）
+    # Merge into existing timesheet (new values overwrite old, deduplicated by key)
     existing_ts = download_df(BLOB_TIMESHEET)
     if existing_ts is not None and not existing_ts.empty and not ts_df.empty:
         combined_ts = pd.concat([existing_ts, ts_df], ignore_index=True)
@@ -313,12 +313,12 @@ def phase_timesheet(state: Dict[str, Any]) -> pd.DataFrame:
     if not combined_ts.empty:
         upload_df(combined_ts, BLOB_TIMESHEET)
 
-    # 返回本次新增部分供 phase_merge 增量处理
+    # Return only new rows for phase_merge incremental processing
     return ts_df
 
 
 # ================================================================
-# PHASE 3: MERGE  (增量，只处理本次新增 key)
+# PHASE 3: MERGE  (incremental, only processes new keys from this run)
 # ================================================================
 def phase_merge(
     state: Dict[str, Any],
@@ -332,7 +332,7 @@ def phase_merge(
     rtc   = _load_rtc()
     rs_df = rs_df if rs_df is not None else download_df(BLOB_ROSTER)
 
-    # 单独跑 merge 时从 blob 读全量 timesheet
+    # When running merge standalone, read full timesheet from blob
     if ts_df is None:
         ts_df = download_df(BLOB_TIMESHEET)
 
@@ -343,13 +343,13 @@ def phase_merge(
         df = download_df(BLOB_MERGED)
         return df if df is not None else pd.DataFrame()
 
-    # 本次新增涉及的 (EmployeeID, Date)
+    # Identify (EmployeeID, Date) keys added or updated this run
     ts_norm = ts_df.rename(columns={"date": "Date", "employee_id": "EmployeeID"}).copy()
     ts_norm["Date"] = pd.to_datetime(ts_norm["Date"])
     new_keys = ts_norm[["EmployeeID", "Date"]].drop_duplicates()
     print(f"  New/updated keys: {len(new_keys)}")
 
-    # 从现有 merged 里剔除这些 key，保留已有的 client/rate 列
+    # Drop those keys from existing merged, preserving existing client/rate columns
     existing = download_df(BLOB_MERGED)
     if existing is not None and not existing.empty:
         existing["Date"] = pd.to_datetime(existing["Date"])
@@ -359,7 +359,7 @@ def phase_merge(
         print(f"  Kept from existing: {len(keep)} rows")
     else:
         keep = pd.DataFrame()
-        print("  No existing merged — full merge")
+        print("  No existing merged data — running full merge")
 
     delta = rtc.merge_timesheet_roster(ts_df, rs_df)
     print(f"  Delta: {len(delta)} rows")
