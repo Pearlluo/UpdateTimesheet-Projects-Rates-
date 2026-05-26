@@ -1,7 +1,7 @@
 """
 resolve_client.py
 =================
-Step 0  : 数据清理 — 删除 WorkType 为无效值的行
+Step 0  : Data cleanup — DISABLED, no rows removed
 Step 1  : Map Project → resourceRequestClient via Project_Client_Map.csv
 Step 2  : For rows still unmatched, query SharePoint via Graph API:
 
@@ -19,11 +19,12 @@ Step 2  : For rows still unmatched, query SharePoint via Graph API:
 Step 3  : Manual overrides
 Step 4  : Write result back to Blob (merged.parquet)
 
-改动说明:
-  - MAIN_XLSX / MAP_CSV 本地路径 → Blob 读写
+Changes:
+  - MAIN_XLSX / MAP_CSV local paths → Blob read/write
   - pd.read_excel / pd.ExcelWriter → download_df_from_blob / upload_df_to_blob
   - pd.read_csv(MAP_CSV) → download_csv_from_blob
-  - 所有业务逻辑、SharePoint 调用、步骤注释原封不动
+  - All business logic, SharePoint calls, and step comments unchanged
+  - Step 0 fully disabled — no rows are removed for any reason
 """
 
 import io
@@ -78,13 +79,6 @@ SP_HOST       = os.getenv("SHAREPOINT_HOST")
 SITE_NAME     = os.getenv("SITE_NAME")
 JOBS_LIST     = os.getenv("GAP_LIST_NAME", "JMS-Jobs")
 PROJ_LIST     = os.getenv("LIST_NAME",     "JMS-Projects")
-
-# ─── WORKTYPE EXCLUSION LIST ─────────────────────────────────────────────────
-
-EXCLUDED_WORKTYPES = {
-    "ASSET DS", "DAY TRIP", "LEAVE", "METRO", "NO CHARGE TRAVEL",
-    "WORKING FROM HOME", "NO CHARGE", "ROSTERED DAY OFF", "PUBLIC HOLIDAY", "NO CHARGE ASSETS"
-}
 
 # ─── MANUAL OVERRIDES ────────────────────────────────────────────────────────
 
@@ -188,7 +182,7 @@ def build_sp_maps(token: str, site_id: str) -> Dict[str, str]:
 
     id_to_atitle: Dict[str, str] = {}
     for item in proj_items:
-        item_id = str(item.get("id") or "").strip()   # top-level, not in fields
+        item_id = str(item.get("id") or "").strip()
         fields  = item.get("fields", {})
         atitle  = str(fields.get("ATitle") or "").strip()
         if item_id and atitle:
@@ -238,23 +232,8 @@ def main():
     df = download_df_from_blob(BLOB_MERGED)
     print(f"  Loaded {len(df)} rows")
 
-    # ── Step 0: Data cleanup ─────────────────────────────────────────────────
-    before = len(df)
-
-    # Remove excluded WorkType
-    wt        = df["WorkType"].astype(str).str.strip().str.upper()
-    drop_wt   = wt.isin(EXCLUDED_WORKTYPES) | wt.isin(["", "NAN"])
-
-    # Remove rows where Project is blank / NaN / 0 / "0"
-    drop_proj = (
-        df["Project"].isna() |                                    # NaN (empty cell)
-        df["Project"].astype(str).str.strip().isin(["", "0", "NAN"])  # blank / zero
-    )
-
-    df = df[~(drop_wt | drop_proj)].reset_index(drop=True)
-    print(f"Step 0: Removed {before - len(df)} rows "
-          f"(excluded WorkType or Project=0/blank) "
-          f"({before} → {len(df)} rows remaining)")
+    # ── Step 0: DISABLED — no rows removed ───────────────────────────────────
+    print(f"Step 0: Skipped — all {len(df)} rows retained")
 
     # ── Load CSV map from Blob ────────────────────────────────────────────────
     print("\nLoading CSV map from Blob...")
@@ -312,7 +291,7 @@ def main():
     upload_df_to_blob(df, BLOB_MERGED)
 
     total_filled = (df["resourceRequestClient"] != "").sum()
-    print(f"\n完成 ✅  resourceRequestClient filled: {total_filled} / {len(df)} rows")
+    print(f"\nDone ✅  resourceRequestClient filled: {total_filled} / {len(df)} rows")
 
 
 if __name__ == "__main__":
