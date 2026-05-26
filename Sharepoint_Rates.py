@@ -1,7 +1,7 @@
 """
 rate_lookup.py
 ==============
-Step 1  : Remove rows where resourceRequestClient = "C0000-Marlu" or contains "Z OH"
+Step 1  : DISABLED — no rows removed
 Step 2  : WorkType → DS / NS
 Step 3  : Match unit rates from JMS-Rates → write to UnitRate column (incremental: skip rows already rated)
 
@@ -113,7 +113,7 @@ def fetch_all_list_items(token: str, site_id: str, list_id: str) -> List[Dict]:
         resp.raise_for_status()
         data = resp.json()
         all_items.extend(data.get("value", []))
-        print(f"  Pulled {len(data.get('value', []))} rows (total {len(all_items)})")
+        print(f"  Pulled {len(data.get('value', []))} rows (total {len(data.get('value', []))})")
         url = data.get("@odata.nextLink")
     return all_items
 
@@ -198,15 +198,8 @@ def main():
     df = download_df_from_blob(BLOB_MERGED)
     print(f"  Loaded {len(df)} rows")
 
-    # ── Step 1: Remove C0000-Marlu and Z OH ──────────────────────
-    before     = len(df)
-    client_col = df["resourceRequestClient"].astype(str).str.strip()
-    drop_mask  = (
-        (client_col.str.upper() == "C0000-MARLU") |
-        (client_col.str.upper().str.contains(r"\bZ\s*OH\b", regex=True, na=False))
-    )
-    df = df[~drop_mask].reset_index(drop=True)
-    print(f"Step 1: Removed {before - len(df)} rows → {len(df)} remaining")
+    # ── Step 1: DISABLED — no rows removed ───────────────────────
+    print(f"Step 1: Skipped — all {len(df)} rows retained")
 
     # ── Step 2: WorkType → DS / NS (recalculate all rows to cover new entries) ──
     df["Shift"] = df["WorkType"].apply(classify_shift)
@@ -215,10 +208,9 @@ def main():
     # ── Step 3: Incremental rate matching ────────────────────────
     # Ensure UnitRate column exists as object dtype to allow None and float together
     if "UnitRate" not in df.columns:
-        df["UnitRate"] = pd.array([None] * len(df), dtype=object)  # ← fix: object dtype
+        df["UnitRate"] = pd.array([None] * len(df), dtype=object)
     else:
-        # Cast existing column to object so None can be assigned alongside floats
-        df["UnitRate"] = df["UnitRate"].astype(object)             # ← fix: cast to object
+        df["UnitRate"] = df["UnitRate"].astype(object)
 
     # Split: already rated vs pending
     rated_mask    = df["UnitRate"].notna()
